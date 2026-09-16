@@ -1,5 +1,6 @@
  
 const API = "https://script.google.com/macros/s/AKfycbzDFG8R-elR_nc1E3lSW6xd6hIpMHE2RKaC9bRiiR5i-ROJgyMiPdFfeM5pAmsBYhct/exec";
+const STORE_API = "https://script.google.com/macros/s/AKfycbzi8L_mvDiOIQmicjbzPGWLFoKVL54snEi0T7Ng6bq_yPI_S85JvckhLde6SZEk12NLZw/exec";
 
 
 
@@ -16,6 +17,18 @@ const ANALYSIS_STATE = {
   month: new Date().getMonth(),
   year: new Date().getFullYear()
 };
+
+const KPI_CACHE_TTL = 3000;
+const KPI_REFRESH_INTERVAL = 3000;
+const INVENTORY_CACHE_TTL = 3000;
+const STORE_SNAPSHOT_CACHE_KEY = "marsh-analysis-live-snapshot-v1";
+const STORE_SNAPSHOT_MAX_AGE = 24 * 60 * 60 * 1000;
+const kpiCache = new Map();
+const kpiAnimations = new Map();
+let activeKpiRequest = null;
+let kpiRequestSequence = 0;
+let latestStoreSnapshot = null;
+let lastKnownExpensesTotal = 0;
 
 // MANEJAR CAMBIO DE MES Y POBLAR EL SELECTOR
 const monthSelect = document.getElementById("analysisMonth");
@@ -35,18 +48,19 @@ monthNames.forEach((name, index) => {
 
 // MANEJAR CAMBIO DE AÑO Y POBLAR EL SELECTOR
 const yearSelect = document.getElementById("analysisYear");
-let yearRange = 5; // Cantidad de años iniciales hacia el futuro
 const currentYear = new Date().getFullYear();
+let firstAvailableYear = currentYear - 5;
+let lastAvailableYear = currentYear + 5;
 
-function populateYearSelect(startYear = currentYear) {
-  // Limpiar opciones actuales
+function populateYearSelect() {
+  const selectedYear = ANALYSIS_STATE.year;
   yearSelect.innerHTML = "";
 
-  for (let y = startYear; y <= startYear + yearRange; y++) {
+  for (let y = firstAvailableYear; y <= lastAvailableYear; y++) {
     const opt = document.createElement("option");
     opt.value = y;
     opt.textContent = y;
-    if (y === ANALYSIS_STATE.year) opt.selected = true;
+    if (y === selectedYear) opt.selected = true;
     yearSelect.appendChild(opt);
   }
 }
@@ -54,32 +68,27 @@ function populateYearSelect(startYear = currentYear) {
 // Llenado inicial
 populateYearSelect();
 
-// Detectar si el usuario selecciona el último año y agregar 5 más
-yearSelect.addEventListener("change", e => {
-  const selectedYear = Number(e.target.value);
-  ANALYSIS_STATE.year = selectedYear;
-  fetchData();
-
-  const options = Array.from(yearSelect.options).map(o => Number(o.value));
-  const lastYear = Math.max(...options);
-
-  if (selectedYear === lastYear) {
-    // Agregar 5 años más
-    populateYearSelect(lastYear + 1);
-    yearSelect.value = selectedYear; // mantener selección
-  }
-});
-
-
 // ESCUCHAR CAMBIOS EN SELECTORES
 monthSelect.addEventListener("change", e => {
   ANALYSIS_STATE.month = Number(e.target.value);
   fetchData();
+  if (topProductsChart) loadTopProductsChart();
 });
 
 yearSelect.addEventListener("change", e => {
-  ANALYSIS_STATE.year = Number(e.target.value);
-  fetchData();
+  const selectedYear = Number(e.target.value);
+  ANALYSIS_STATE.year = selectedYear;
+
+  if (selectedYear === lastAvailableYear) {
+    lastAvailableYear += 5;
+    populateYearSelect();
+    yearSelect.value = String(selectedYear);
+  }
+
+  fetchData().finally(() => {
+    loadSalesByMonthChart();
+    loadTopProductsChart();
+  });
 });
 
 
@@ -91,37 +100,365 @@ let topProductsChart = null;
 
 
 // 🔹 Función para obtener los KPIs y top productos
-function fetchData() {
-  const { month, year } = ANALYSIS_STATE;
+function getPeriodKey(month, year) {
+  return `${year}-${month}`;
+}
 
-  fetch(`${API}?action=kpis&month=${month}&year=${year}`)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.success) return;
+function isFuturePeriod(month, year) {
+  const today = new Date();
+  return year > today.getFullYear() ||
+    (year === today.getFullYear() && month > today.getMonth());
+}
 
-      animateNumber("kpiVentas", data.totalVentas);
-      animateNumber("kpiGanancia", data.gananciaNeta);
-      animateNumber("kpiDescuentos", data.totalDescuentos);
-      animateNumber("kpiSinDescuento", data.ventasSinDescuento);
-      animateNumber("ganancia_neta", data.gananciaNeta);
+function toStoreNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  return Number(String(value ?? "0").replace(/[^\d.-]/g, "")) || 0;
+}
 
-      document.getElementById("totalpagado").textContent =
-        "$" + Number(data.totalGastos || 0).toLocaleString("es-CO");
+function normalizeStoreText(value) {
+  return String(value || "").trim().toLocaleLowerCase("es-CO");
+}
 
-      // Top productos
-      const tbody = document.getElementById("top_productos");
-      tbody.innerHTML = "";
-      data.topProductos.forEach(p => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${p.producto}</td>
-          <td>${p.marca}</td>
-          <td>${p.cantidad}</td>
-          <td>$${p.ganancia.toLocaleString("es-CO")}</td>
-        `;
-        tbody.appendChild(tr);
-      });
+function parseStoreSaleDate(fecha) {
+  if (!fecha) return null;
+
+  const directDate = new Date(fecha);
+  if (!Number.isNaN(directDate.getTime()) && /[T/-]/.test(String(fecha))) {
+    return directDate;
+  }
+
+  const months = {
+    enero: 0, febrero: 1, marzo: 2, abril: 3, mayo: 4, junio: 5,
+    julio: 6, agosto: 7, septiembre: 8, octubre: 9, noviembre: 10, diciembre: 11
+  };
+  const parts = String(fecha).trim().toLocaleLowerCase("es-CO").split(/\s+/);
+  const monthIndex = parts.findIndex(part =>
+    Object.prototype.hasOwnProperty.call(months, part)
+  );
+  if (monthIndex < 1) return null;
+
+  const day = Number(parts[monthIndex - 1]);
+  const year = Number(parts[monthIndex + 1]);
+  if (!day || !year) return null;
+  return new Date(year, months[parts[monthIndex]], day);
+}
+
+function buildInventoryIndex(inventory) {
+  const byId = new Map();
+  const byNameAndBrand = new Map();
+
+  (Array.isArray(inventory) ? inventory : []).forEach(product => {
+    if (product.id != null) byId.set(String(product.id), product);
+    const key = `${normalizeStoreText(product.nombre)}|${normalizeStoreText(product.marca)}`;
+    byNameAndBrand.set(key, product);
+  });
+
+  return { byId, byNameAndBrand };
+}
+
+function getSaleCost(sale, inventoryIndex) {
+  const quantity = Math.max(toStoreNumber(sale.cantidad), 0);
+  const explicitTotal = [
+    sale.costoTotal, sale.totalCosto, sale.costo_total, sale.inversion
+  ].map(toStoreNumber).find(value => value > 0);
+  if (explicitTotal) return explicitTotal;
+
+  const explicitUnit = [sale.costoUnitario, sale.costo_unitario, sale.costo]
+    .map(toStoreNumber)
+    .find(value => value > 0);
+  if (explicitUnit) return explicitUnit * quantity;
+
+  const key = `${normalizeStoreText(sale.producto)}|${normalizeStoreText(sale.marca)}`;
+  const product = inventoryIndex.byId.get(String(sale.productoId ?? sale.idProducto ?? "")) ||
+    inventoryIndex.byNameAndBrand.get(key);
+  const inventoryUnitCost = toStoreNumber(product?.costo);
+  if (inventoryUnitCost > 0) return inventoryUnitCost * quantity;
+
+  const explicitProfit = toStoreNumber(sale.ganancia);
+  const total = toStoreNumber(sale.total);
+  if (explicitProfit > 0 && total >= explicitProfit) return total - explicitProfit;
+
+  // Respaldo para ventas antiguas que no guardaron el costo; el margen inicial era 100%.
+  return toStoreNumber(sale.subtotal || sale.total) / 2;
+}
+
+function buildLiveKpiData(sales, inventory, month, year) {
+  const inventoryIndex = buildInventoryIndex(inventory);
+  const periodSales = (Array.isArray(sales) ? sales : []).filter(sale => {
+    const date = parseStoreSaleDate(sale.fecha);
+    return date && date.getMonth() === month && date.getFullYear() === year;
+  });
+
+  let totalVentas = 0;
+  let totalDescuentos = 0;
+  let totalCostos = 0;
+  const products = new Map();
+
+  periodSales.forEach(sale => {
+    const total = toStoreNumber(sale.total);
+    const discount = toStoreNumber(sale.descuento);
+    const cost = getSaleCost(sale, inventoryIndex);
+    const quantity = toStoreNumber(sale.cantidad);
+    const productKey = `${normalizeStoreText(sale.producto)}|${normalizeStoreText(sale.marca)}`;
+    const current = products.get(productKey) || {
+      producto: sale.producto || "Producto",
+      marca: sale.marca || "Sin marca",
+      cantidad: 0,
+      ganancia: 0
+    };
+
+    totalVentas += total;
+    totalDescuentos += discount;
+    totalCostos += cost;
+    current.cantidad += quantity;
+    current.ganancia += total - cost;
+    products.set(productKey, current);
+  });
+
+  const gananciaConDescuento = totalVentas - totalCostos;
+  return {
+    success: true,
+    totalVentas,
+    totalDescuentos,
+    ventasSinDescuento: totalCostos,
+    gananciaConDescuento,
+    gananciaNeta: gananciaConDescuento - lastKnownExpensesTotal,
+    totalGastos: lastKnownExpensesTotal,
+    topProductos: [...products.values()]
+      .sort((a, b) => b.cantidad - a.cantidad)
+      .slice(0, 10)
+  };
+}
+
+function getSalesFingerprint(sales) {
+  return (Array.isArray(sales) ? sales : [])
+    .map(sale => [sale.id, sale.total, sale.cantidad, sale.descuento, sale.fecha, sale.hora].join("|"))
+    .sort()
+    .join(";");
+}
+
+function getInventoryFingerprint(inventory) {
+  return (Array.isArray(inventory) ? inventory : [])
+    .map(product => [
+      product.id,
+      product.nombre,
+      product.marca,
+      product.costo,
+      product.stock,
+      product.vendidos
+    ].join("|"))
+    .sort()
+    .join(";");
+}
+
+function restoreStoreSnapshot() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const cached = JSON.parse(localStorage.getItem(STORE_SNAPSHOT_CACHE_KEY) || "null");
+    if (!cached || !Array.isArray(cached.sales) || !Array.isArray(cached.inventory)) return null;
+    if (Date.now() - Number(cached.updatedAt || 0) > STORE_SNAPSHOT_MAX_AGE) return null;
+
+    return {
+      sales: cached.sales,
+      inventory: cached.inventory,
+      salesFingerprint: getSalesFingerprint(cached.sales),
+      inventoryFingerprint: getInventoryFingerprint(cached.inventory),
+      updatedAt: Number(cached.updatedAt || 0),
+      inventoryUpdatedAt: Number(cached.inventoryUpdatedAt || cached.updatedAt || 0)
+    };
+  } catch (err) {
+    console.warn("No se pudo recuperar la última sincronización:", err);
+    return null;
+  }
+}
+
+function persistStoreSnapshot(snapshot) {
+  try {
+    if (typeof localStorage === "undefined" || !snapshot) return;
+    localStorage.setItem(STORE_SNAPSHOT_CACHE_KEY, JSON.stringify({
+      sales: snapshot.sales,
+      inventory: snapshot.inventory,
+      updatedAt: snapshot.updatedAt,
+      inventoryUpdatedAt: snapshot.inventoryUpdatedAt
+    }));
+  } catch (err) {
+    console.warn("No se pudo guardar la última sincronización:", err);
+  }
+}
+
+function setKpiUpdating(isUpdating) {
+  const grid = document.querySelector(".analysis-grid");
+  if (!grid) return;
+  grid.classList.toggle("is-updating", isUpdating);
+  grid.setAttribute("aria-busy", String(isUpdating));
+}
+
+function setKpiPeriodMessage(message = "") {
+  document.querySelectorAll(".analysis-grid .kpi-period-status").forEach(el => {
+    el.textContent = message;
+    el.hidden = !message;
+  });
+}
+
+function renderKpiValues(data, periodMessage = "") {
+  const safeData = data || {};
+
+  animateNumber("kpiVentas", Number(safeData.totalVentas || 0));
+  animateNumber("kpiGanancia", Number(safeData.gananciaNeta || 0));
+  animateNumber("kpiDescuentos", Number(safeData.totalDescuentos || 0));
+  animateNumber("kpiSinDescuento", Number(safeData.ventasSinDescuento || 0));
+  animateNumber("ganancia_neta", Number(safeData.gananciaNeta || 0));
+
+  document.getElementById("totalpagado").textContent =
+    "$" + Number(safeData.totalGastos || 0).toLocaleString("es-CO");
+
+  setKpiPeriodMessage(periodMessage);
+
+  const tbody = document.getElementById("top_productos");
+  if (!tbody) return;
+
+  tbody.innerHTML = "";
+  (Array.isArray(safeData.topProductos) ? safeData.topProductos : []).forEach(p => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${p.producto}</td>
+      <td>${p.marca}</td>
+      <td>${p.cantidad}</td>
+      <td>$${Number(p.ganancia || 0).toLocaleString("es-CO")}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function renderKpiResponse(data) {
+  const hasSales = Number(data.totalVentas || 0) > 0;
+  renderKpiValues(
+    data,
+    hasSales ? "" : "No se registraron ventas en este período."
+  );
+}
+
+// Obtiene un solo resultado vigente por periodo. Las respuestas anteriores se descartan.
+async function fetchData({ force = false, background = false } = {}) {
+  const month = ANALYSIS_STATE.month;
+  const year = ANALYSIS_STATE.year;
+  const periodKey = getPeriodKey(month, year);
+
+  if (isFuturePeriod(month, year)) {
+    renderKpiValues({}, "Este período aún no ha llegado.");
+    setKpiUpdating(false);
+    return;
+  }
+
+  if (latestStoreSnapshot) {
+    const currentData = buildLiveKpiData(
+      latestStoreSnapshot.sales,
+      latestStoreSnapshot.inventory,
+      month,
+      year
+    );
+    kpiCache.set(periodKey, { data: currentData, updatedAt: latestStoreSnapshot.updatedAt });
+    renderKpiResponse(currentData);
+
+    if (!force && Date.now() - latestStoreSnapshot.updatedAt < KPI_CACHE_TTL) {
+      setKpiUpdating(false);
+      return currentData;
+    }
+  }
+
+  // El mismo listado de ventas sirve para cualquier filtro; no se duplica la consulta.
+  if (activeKpiRequest) return;
+
+  const requestId = ++kpiRequestSequence;
+
+  const controller = new AbortController();
+  activeKpiRequest = controller;
+  setKpiUpdating(true);
+
+  try {
+    const cacheBuster = Date.now();
+    const refreshInventory = !latestStoreSnapshot ||
+      Date.now() - latestStoreSnapshot.inventoryUpdatedAt >= INVENTORY_CACHE_TTL;
+
+    const salesPromise = fetch(
+      `${STORE_API}?action=sales&_=${cacheBuster}`,
+      { signal: controller.signal, cache: "no-store" }
+    ).then(async res => {
+      if (!res.ok) throw new Error(`Ventas HTTP ${res.status}`);
+      const sales = await res.json();
+      if (!Array.isArray(sales)) throw new Error("Respuesta de ventas inválida");
+      return sales;
     });
+
+    const inventoryPromise = refreshInventory
+      ? fetch(
+          `${STORE_API}?action=list&_=${cacheBuster}`,
+          { signal: controller.signal, cache: "no-store" }
+        ).then(async res => {
+          if (!res.ok) throw new Error(`Inventario HTTP ${res.status}`);
+          const inventory = await res.json();
+          return Array.isArray(inventory) ? inventory : [];
+        }).catch(err => {
+          if (err.name === "AbortError") throw err;
+          console.warn("No se pudo refrescar el costo del inventario:", err);
+          return latestStoreSnapshot?.inventory || [];
+        })
+      : Promise.resolve(latestStoreSnapshot.inventory);
+
+    const [sales, inventory] = await Promise.all([salesPromise, inventoryPromise]);
+    if (requestId !== kpiRequestSequence) return;
+
+    const previousFingerprint = latestStoreSnapshot?.salesFingerprint || "";
+    const previousInventoryFingerprint = latestStoreSnapshot?.inventoryFingerprint || "";
+    const salesFingerprint = getSalesFingerprint(sales);
+    const inventoryFingerprint = getInventoryFingerprint(inventory);
+    const salesChanged = salesFingerprint !== previousFingerprint;
+    const inventoryChanged = inventoryFingerprint !== previousInventoryFingerprint;
+    const now = Date.now();
+
+    latestStoreSnapshot = {
+      sales,
+      inventory,
+      salesFingerprint,
+      inventoryFingerprint,
+      updatedAt: now,
+      inventoryUpdatedAt: refreshInventory
+        ? now
+        : latestStoreSnapshot.inventoryUpdatedAt
+    };
+    persistStoreSnapshot(latestStoreSnapshot);
+
+    const selectedMonth = ANALYSIS_STATE.month;
+    const selectedYear = ANALYSIS_STATE.year;
+    const selectedKey = getPeriodKey(selectedMonth, selectedYear);
+    const data = buildLiveKpiData(sales, inventory, selectedMonth, selectedYear);
+
+    kpiCache.set(selectedKey, { data, updatedAt: now });
+    renderKpiResponse(data);
+
+    if (salesChanged) {
+      if (salesByMonthChart) loadSalesByMonthChart();
+      if (topProductsChart) loadTopProductsChart();
+    }
+    if (salesChanged || inventoryChanged) {
+      renderBrandAnalysis();
+    }
+
+    return data;
+  } catch (err) {
+    if (err.name !== "AbortError" && requestId === kpiRequestSequence) {
+      console.error("Error actualizando KPIs:", err);
+      if (!background) {
+        setKpiPeriodMessage("No fue posible actualizar. Se conserva el último dato visible.");
+        showToast("No fue posible actualizar los indicadores");
+      }
+    }
+  } finally {
+    if (requestId === kpiRequestSequence) {
+      activeKpiRequest = null;
+      setKpiUpdating(false);
+    }
+  }
 }
 
 
@@ -162,21 +499,42 @@ function formatNumber(num) {
 // 🔹 Animación tipo "baloto" para cada KPI
 function animateNumber(id, target) {
   const el = document.getElementById(id);
-  let current = parseInt(el.getAttribute("data-current") || 0);
-  const diff = target - current;
-  const step = Math.ceil(Math.abs(diff)/20);
-  if (diff === 0) return;
-  const direction = diff > 0 ? 1 : -1;
+  if (!el) return;
 
-  const interval = setInterval(() => {
-    current += step * direction;
-    if ((direction>0 && current >= target) || (direction<0 && current <= target)) {
-      current = target;
-      clearInterval(interval);
+  const previousAnimation = kpiAnimations.get(id);
+  if (previousAnimation) cancelAnimationFrame(previousAnimation);
+
+  const safeTarget = Number(target || 0);
+  const current = Number(el.getAttribute("data-current") || 0);
+  const difference = safeTarget - current;
+
+  if (difference === 0) {
+    el.textContent = "$" + formatNumber(safeTarget);
+    el.setAttribute("data-current", safeTarget);
+    return;
+  }
+
+  const startedAt = performance.now();
+  const duration = 520;
+
+  function tick(now) {
+    const progress = Math.min((now - startedAt) / duration, 1);
+    const eased = 1 - Math.pow(1 - progress, 3);
+    const value = Math.round(current + difference * eased);
+
+    el.textContent = "$" + formatNumber(value);
+    el.setAttribute("data-current", value);
+
+    if (progress < 1) {
+      kpiAnimations.set(id, requestAnimationFrame(tick));
+    } else {
+      el.textContent = "$" + formatNumber(safeTarget);
+      el.setAttribute("data-current", safeTarget);
+      kpiAnimations.delete(id);
     }
-    el.textContent = "$" + formatNumber(current);
-    el.setAttribute("data-current", current);
-  }, 50);
+  }
+
+  kpiAnimations.set(id, requestAnimationFrame(tick));
 }
 
 
@@ -219,6 +577,20 @@ async function fetchExpenses() {
     const data = await res.json();
 
     if (!data || !Array.isArray(data)) return;
+
+    lastKnownExpensesTotal = data.reduce(
+      (sum, expense) => sum + toStoreNumber(expense.valor),
+      0
+    );
+
+    if (latestStoreSnapshot && !isFuturePeriod(ANALYSIS_STATE.month, ANALYSIS_STATE.year)) {
+      renderKpiResponse(buildLiveKpiData(
+        latestStoreSnapshot.sales,
+        latestStoreSnapshot.inventory,
+        ANALYSIS_STATE.month,
+        ANALYSIS_STATE.year
+      ));
+    }
 
     const list = document.getElementById("expenseList");
     list.innerHTML = "";
@@ -329,12 +701,16 @@ function setTotalVentasAnio(total) {
 // 🔹 Cargar gráfico de ventas por mes
 async function loadSalesByMonthChart() {
   const { year } = ANALYSIS_STATE; // Tomamos el año seleccionado
-  const res = await fetch(`${API}?action=chart_sales_month&year=${year}`);
-  const data = await res.json();
-  if (!data.success) return;
+  const labels = [...monthNames];
+  const monthlySales = Array(12).fill(0);
 
-  // 🔹 TOTAL ANUAL del año seleccionado
-  const totalAnual = data.data.reduce(
+  (latestStoreSnapshot?.sales || []).forEach(sale => {
+    const date = parseStoreSaleDate(sale.fecha);
+    if (!date || date.getFullYear() !== year) return;
+    monthlySales[date.getMonth()] += toStoreNumber(sale.total);
+  });
+
+  const totalAnual = monthlySales.reduce(
     (sum, val) => sum + Number(val || 0),
     0
   );
@@ -348,10 +724,10 @@ async function loadSalesByMonthChart() {
   salesByMonthChart = new Chart(ctx, {
     type: "line",
     data: {
-      labels: data.labels,
+      labels,
       datasets: [{
         label: `Ventas del Año ${year}`,
-        data: data.data,
+        data: monthlySales,
         tension: 0.4,
         fill: true
       }]
@@ -368,9 +744,12 @@ async function loadSalesByMonthChart() {
 
 // 🔹 Cargar gráfico de top productos
 async function loadTopProductsChart() {
-  const res = await fetch(API + "?action=chart_top_products");
-  const data = await res.json();
-  if (!data.success) return;
+  const data = buildLiveKpiData(
+    latestStoreSnapshot?.sales || [],
+    latestStoreSnapshot?.inventory || [],
+    ANALYSIS_STATE.month,
+    ANALYSIS_STATE.year
+  ).topProductos;
 
   const ctx = document.getElementById("topProductsChart");
 
@@ -379,10 +758,10 @@ async function loadTopProductsChart() {
   topProductsChart = new Chart(ctx, {
     type: "bar",
     data: {
-      labels: data.labels,
+      labels: data.map(product => product.producto),
       datasets: [{
         label: "Cantidad Vendida",
-        data: data.data
+        data: data.map(product => product.cantidad)
       }]
     },
     options: {
@@ -407,30 +786,36 @@ brandModalClose.addEventListener("click", () => {
 });
 
 // Función para mostrar productos de una marca
-function showBrandProducts(marca) {
+async function showBrandProducts(marca) {
   brandModalTitle.textContent = `Productos de ${marca}`;
-  
-  // Obtener productos del inventario
-  fetch(API + "?action=list")
-    .then(res => res.json())
-    .then(products => {
-      const filtered = products.filter(p => p.marca === marca);
-      brandProductsTableBody.innerHTML = "";
-      
-      filtered.forEach(p => {
-        const totalInversion = p.costo * p.stock;
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${p.nombre}</td>
-          <td>${p.stock}</td>
-          <td>$${Number(p.costo).toLocaleString()}</td>
-          <td>$${Number(totalInversion).toLocaleString()}</td>
-        `;
-        brandProductsTableBody.appendChild(tr);
-      });
 
-      brandModal.classList.remove("hidden");
-    });
+  let products = latestStoreSnapshot?.inventory || [];
+  if (!products.length) {
+    try {
+      const res = await fetch(`${STORE_API}?action=list&_=${Date.now()}`, { cache: "no-store" });
+      products = await res.json();
+    } catch (err) {
+      console.error("Error obteniendo productos de la marca:", err);
+    }
+  }
+
+  const filtered = (Array.isArray(products) ? products : [])
+    .filter(product => normalizeStoreText(product.marca) === normalizeStoreText(marca));
+  brandProductsTableBody.innerHTML = "";
+
+  filtered.forEach(product => {
+    const totalInversion = toStoreNumber(product.costo) * toStoreNumber(product.stock);
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${product.nombre}</td>
+      <td>${product.stock}</td>
+      <td>$${toStoreNumber(product.costo).toLocaleString("es-CO")}</td>
+      <td>$${totalInversion.toLocaleString("es-CO")}</td>
+    `;
+    brandProductsTableBody.appendChild(tr);
+  });
+
+  brandModal.classList.remove("hidden");
 }
 
 // 🔹 Agregar evento click a cada marca en la tabla de análisis
@@ -444,72 +829,111 @@ document.querySelectorAll(".brand-analysis-card tbody tr td:first-child").forEac
 
 // 🔹 Cargar análisis por marca
 async function renderBrandAnalysis() {
-  try {
-    const res = await fetch(API + "?action=analysis_by_brand");
-    const data = await res.json();
+  const tbody = document.querySelector("#brandAnalysisTable tbody");
+  if (!tbody) return;
 
-    const tbody = document.querySelector("#brandAnalysisTable tbody");
-    tbody.innerHTML = "";
+  const inventory = latestStoreSnapshot?.inventory || [];
+  const sales = latestStoreSnapshot?.sales || [];
+  const inventoryIndex = buildInventoryIndex(inventory);
+  const brands = new Map();
 
-    if (data.success && data.data.length > 0) {
-      data.data.forEach(b => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${b.marca}</td>
-          <td>${b.productos}</td>
-          <td>${b.vendidos}</td>
-          <td>$${b.inversion.toLocaleString()}</td>
-          <td>$${b.ventas.toLocaleString()}</td>
-          <td>$${b.ganancia.toLocaleString()}</td>
-        `;
+  inventory.forEach(product => {
+    const key = normalizeStoreText(product.marca) || "sin marca";
+    const current = brands.get(key) || {
+      marca: product.marca || "Sin marca",
+      productos: 0,
+      vendidos: 0,
+      inversion: 0,
+      ventas: 0,
+      ganancia: 0
+    };
+    current.productos += 1;
+    current.inversion += toStoreNumber(product.costo) * toStoreNumber(product.stock);
+    brands.set(key, current);
+  });
 
-        // 🔹 Agregar click al nombre de la marca
-        tr.querySelector("td:first-child").style.cursor = "pointer";
-        tr.querySelector("td:first-child").addEventListener("click", () => {
-          showBrandProducts(b.marca);
-        });
+  sales.forEach(sale => {
+    const key = normalizeStoreText(sale.marca) || "sin marca";
+    const current = brands.get(key) || {
+      marca: sale.marca || "Sin marca",
+      productos: 0,
+      vendidos: 0,
+      inversion: 0,
+      ventas: 0,
+      ganancia: 0
+    };
+    const total = toStoreNumber(sale.total);
+    current.vendidos += toStoreNumber(sale.cantidad);
+    current.ventas += total;
+    current.ganancia += total - getSaleCost(sale, inventoryIndex);
+    brands.set(key, current);
+  });
 
-        tbody.appendChild(tr);
-      });
-    } else {
-      tbody.innerHTML = `<tr><td colspan="6">No hay datos</td></tr>`;
-    }
+  const data = [...brands.values()].sort((a, b) => b.ventas - a.ventas);
+  tbody.innerHTML = "";
 
-  } catch (err) {
-    console.error("Error al cargar análisis por marca:", err);
+  if (!data.length) {
+    tbody.innerHTML = `<tr><td colspan="6">No hay datos</td></tr>`;
+    return;
   }
+
+  data.forEach(brand => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${brand.marca}</td>
+      <td>${brand.productos}</td>
+      <td>${brand.vendidos}</td>
+      <td>$${brand.inversion.toLocaleString("es-CO")}</td>
+      <td>$${brand.ventas.toLocaleString("es-CO")}</td>
+      <td>$${brand.ganancia.toLocaleString("es-CO")}</td>
+    `;
+    tr.querySelector("td:first-child").style.cursor = "pointer";
+    tr.querySelector("td:first-child").addEventListener("click", () => {
+      showBrandProducts(brand.marca);
+    });
+    tbody.appendChild(tr);
+  });
 }
 
 
-// Llamar al cargar la vista Análisis
-document.addEventListener("DOMContentLoaded", () => {
-  renderBrandAnalysis();
-});
-
-
-
-
-
-// 🔄 Actualizar KPIs y gastos cada segundo
+// Gastos usan su backend administrativo; ventas y marcas se actualizan aparte en vivo.
 setInterval(() => {
-  fetchData();
+  if (activeKpiRequest) return;
   fetchExpenses();
-  renderBrandAnalysis();
-}, 3000);
+}, 30000);
+
+// Los KPIs se sincronizan sin competir con los cambios manuales de filtro.
+setInterval(() => {
+  if (document.visibilityState === "visible") {
+    fetchData({ force: true, background: true });
+  }
+}, KPI_REFRESH_INTERVAL);
+
+function syncNowWhenReturning() {
+  if (document.visibilityState === "visible") {
+    fetchData({ force: true, background: true });
+  }
+}
+
+document.addEventListener("visibilitychange", syncNowWhenReturning);
+window.addEventListener("focus", syncNowWhenReturning);
+window.addEventListener("online", syncNowWhenReturning);
 
 
 setInterval(() => {
+  if (activeKpiRequest) return;
   loadSalesByMonthChart();
   loadTopProductsChart();
 }, 120000);
 
-// Primera carga
-fetchData();
-fetchExpenses();
-
-// Cargar gráficos solo una vez
-loadSalesByMonthChart();
-loadTopProductsChart();
+// Primera carga: pinta la última sincronización al instante y valida el dato en vivo.
+latestStoreSnapshot = restoreStoreSnapshot();
+fetchData({ force: true, background: Boolean(latestStoreSnapshot) }).finally(() => {
+  fetchExpenses();
+  renderBrandAnalysis();
+  loadSalesByMonthChart();
+  loadTopProductsChart();
+});
 /* ================================================================================================================================================================================================================================================================================================================================================================
  FINAL DE LA SECCION DE ANALISIS
 ==================================================================================================================================================================================================================================================================================================================================================================  */

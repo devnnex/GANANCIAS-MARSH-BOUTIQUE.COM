@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8" />
-  <title>🌸Ganancias Rosabelle | Santana Group🌸</title>
+  <title>Ganancias Marsh</title>
 
   <!-- Responsive + iOS FIX -->
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
@@ -16,7 +16,12 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Ganancias Rosabelle App">
+  <meta name="apple-mobile-web-app-title" content="Ganancias Marsh">
+
+  <!-- Conexión anticipada al backend para acelerar la primera carga -->
+  <link rel="preconnect" href="https://script.google.com" crossorigin>
+  <link rel="preconnect" href="https://script.googleusercontent.com" crossorigin>
+  <link rel="dns-prefetch" href="https://script.google.com">
 
   <!-- Icons -->
   <link rel="apple-touch-icon" sizes="180x180" href="./images/favicon.png">
@@ -43,12 +48,9 @@
 ========================= -->
 <header class="navbar">
   <div class="nav-left">
-    <img src="images/logo.png" alt="Santana Group" class="logo">
+    <img src="images/logo-header.png" alt="Marsh" class="logo" width="137" height="48" decoding="async">
   </div>
 
-  <nav class="nav-menu">
-    <a class="active" data-view="analisis">Análisis</a>
-  </nav>
 </header>
 
 <!-- =========================
@@ -60,7 +62,7 @@
       <!-- =====================
      VISTA ANALISIS
 ====================== -->
-<section id="view-analisis" class="view">
+<section id="view-analisis" class="view active">
   
 
   <!-- HEADER -->
@@ -81,22 +83,26 @@
 
     <div class="analysis-card primary">
       <h4>Ventas del Mes</h4>
-      <span id="kpiVentas">$0</span>
+      <span id="kpiVentas">Cargando...</span>
+      <small class="kpi-period-status" hidden></small>
     </div>
 
     <div class="analysis-card success">
       <h4>Ganancia/Mes con Descuentos</h4>
-      <span id="kpiGanancia">$0</span>
+      <span id="kpiGanancia">Cargando...</span>
+      <small class="kpi-period-status" hidden></small>
     </div>
 
     <div class="analysis-card warning">
       <h4>Total Descuentos</h4>
-      <span id="kpiDescuentos">$0</span>
+      <span id="kpiDescuentos">Cargando...</span>
+      <small class="kpi-period-status" hidden></small>
     </div>
 
     <div class="analysis-card info">
       <h4>Sugerido a Invertir</h4>
-      <span id="kpiSinDescuento">$0</span>
+      <span id="kpiSinDescuento">Cargando...</span>
+      <small class="kpi-period-status" hidden></small>
     </div>
 
   </div>
@@ -200,7 +206,7 @@
   FOOTER
 ========================= -->
 <footer class="footer">
-  © 2025 Santana Group
+  © 2026 Marsh
 </footer>
 
 
