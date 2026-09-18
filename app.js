@@ -228,8 +228,6 @@ async function cargarInventario() {
         String(p.costo ?? 0).replace(/[^\d.-]/g, "")
       ) || 0;
 
-      const margen = Number(p.margen);
-
       const stock = Number(p.stock) || 0;
 
       qtyState[p.id] = 0;
@@ -245,7 +243,6 @@ async function cargarInventario() {
       return `
         <tr
           data-id="${p.id}"
-          data-margen="${Number.isFinite(margen) ? margen : 100}"
           class="${esNuevo ? "row-new" : ""}"
           ${esNuevo ? `title="Producto agregado ${tiempoNuevo}"` : ""}>
 
@@ -1787,8 +1784,8 @@ function editarProducto(id) {
   // 🔹 costo real (base del cálculo)
   form.costo.value = costo;
 
-  // conservar el margen guardado para permitir editarlo
-  form.margen.value = row.dataset.margen;
+  // margen solo como input de cálculo
+  form.margen.value = 100;
 
   // 🔐 estado de edición (mínimo necesario)
   editState = {
