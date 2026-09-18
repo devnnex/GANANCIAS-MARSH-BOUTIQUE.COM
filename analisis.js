@@ -29,6 +29,7 @@ let activeKpiRequest = null;
 let kpiRequestSequence = 0;
 let latestStoreSnapshot = null;
 let lastKnownExpensesTotal = 0;
+let expenses = [];
 
 // MANEJAR CAMBIO DE MES Y POBLAR EL SELECTOR
 const monthSelect = document.getElementById("analysisMonth");
@@ -540,102 +541,196 @@ function animateNumber(id, target) {
 
 // 🔹 Agregar gasto
 // 🔹 Agregar gasto
-document.getElementById("btnAgregarGasto").addEventListener("click", async (e) => {
-  e.preventDefault(); // 🔹 Evita que el formulario recargue la página
+function updateExpenseKpis() {
+  lastKnownExpensesTotal = expenses.reduce(
+    (sum, expense) => sum + toStoreNumber(expense.valor),
+    0
+  );
 
-  const nombre = document.getElementById("gastoNombre").value.trim();
-  const valor = Number(document.getElementById("gastoValor").value);
-  if(!nombre || !valor) return alert("Ingrese nombre y valor del gasto");
-
-  try {
-    await fetch(API, {
-      method: "POST",
-      mode: "no-cors",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ action:"add_expense", nombre, valor })
-    });
-
-    document.getElementById("gastoNombre").value = "";
-    document.getElementById("gastoValor").value = "";
-
-    // 🔄 Actualizar KPIs y lista de gastos inmediatamente
-    fetchData();
-    fetchExpenses();
-
-  } catch(err) {
-    console.error("Error agregando gasto:", err);
+  if (latestStoreSnapshot && !isFuturePeriod(ANALYSIS_STATE.month, ANALYSIS_STATE.year)) {
+    renderKpiResponse(buildLiveKpiData(
+      latestStoreSnapshot.sales,
+      latestStoreSnapshot.inventory,
+      ANALYSIS_STATE.month,
+      ANALYSIS_STATE.year
+    ));
+    return;
   }
-});
 
+  // En la primera carga, fetchData usará el total local al terminar de cargar ventas.
+  fetchData({ background: true });
+}
 
+function sendExpenseChange(action, payload) {
+  return fetch(API, {
+    method: "POST",
+    mode: "no-cors",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...payload })
+  });
+}
 
-// 🔹 Obtener y renderizar lista de gastos
-// 🔹 Obtener y renderizar lista de gastos
-async function fetchExpenses() {
-  try {
-    const res = await fetch(API + "?action=expenses");
-    const data = await res.json();
+function scheduleExpensesSync() {
+  // Apps Script puede tardar unos instantes en reflejar el cambio guardado.
+  window.setTimeout(fetchExpenses, 750);
+}
 
-    if (!data || !Array.isArray(data)) return;
+function createExpenseButton(label, className, onClick, title) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.title = title;
+  button.setAttribute("aria-label", title);
+  button.addEventListener("click", onClick);
+  return button;
+}
 
-    lastKnownExpensesTotal = data.reduce(
-      (sum, expense) => sum + toStoreNumber(expense.valor),
-      0
+function renderExpenses() {
+  const list = document.getElementById("expenseList");
+  if (!list) return;
+  list.innerHTML = "";
+
+  expenses.forEach(expense => {
+    const li = document.createElement("li");
+    li.className = "expense-item";
+    li.dataset.expenseId = String(expense.id);
+
+    const text = document.createElement("span");
+    text.className = "expense-text";
+    text.append(`${expense.nombre}: `);
+    const value = document.createElement("span");
+    value.className = "expense-value";
+    value.textContent = `$${toStoreNumber(expense.valor).toLocaleString("es-CO")}`;
+    text.appendChild(value);
+
+    const actions = document.createElement("span");
+    actions.className = "expense-actions";
+    actions.append(
+      createExpenseButton("Editar", "expense-edit", () => editExpense(expense), "Editar gasto"),
+      createExpenseButton("Eliminar", "expense-delete", () => deleteExpense(expense), "Eliminar gasto")
     );
 
-    if (latestStoreSnapshot && !isFuturePeriod(ANALYSIS_STATE.month, ANALYSIS_STATE.year)) {
-      renderKpiResponse(buildLiveKpiData(
-        latestStoreSnapshot.sales,
-        latestStoreSnapshot.inventory,
-        ANALYSIS_STATE.month,
-        ANALYSIS_STATE.year
-      ));
-    }
+    li.append(text, actions);
+    list.appendChild(li);
+  });
 
-    const list = document.getElementById("expenseList");
-    list.innerHTML = "";
+  updateExpenseKpis();
+}
 
-    data.forEach(g => {
-      const li = document.createElement("li");
-      li.className = "expense-item";
+async function addExpense(event) {
+  event.preventDefault();
+  const nameInput = document.getElementById("gastoNombre");
+  const valueInput = document.getElementById("gastoValor");
+  const nombre = nameInput.value.trim();
+  const valor = Number(valueInput.value);
+  if (!nombre || !Number.isFinite(valor) || valor <= 0) {
+    alert("Ingrese nombre y un valor mayor a cero para el gasto");
+    return;
+  }
 
-      // Texto gasto
-      const span = document.createElement("span");
-      span.className = "expense-text";
-      span.innerHTML = `
-        ${g.nombre}:
-        <span class="expense-value">
-          $${Number(g.valor).toLocaleString("es-CO")}
-        </span>
-      `;
+  const temporaryExpense = { id: `pending-${Date.now()}`, nombre, valor };
+  expenses.push(temporaryExpense);
+  nameInput.value = "";
+  valueInput.value = "";
+  renderExpenses();
 
-       // Botón eliminar
-      const btn = document.createElement("button");
-      btn.className = "expense-delete";
-      btn.textContent = "🗑️";
+  try {
+    await sendExpenseChange("add_expense", { nombre, valor });
+    scheduleExpensesSync();
+  } catch (err) {
+    expenses = expenses.filter(expense => expense.id !== temporaryExpense.id);
+    renderExpenses();
+    console.error("Error agregando gasto:", err);
+    alert("No fue posible guardar el gasto. Inténtelo de nuevo.");
+  }
+}
 
-      btn.addEventListener("click", async () => {
-        if (!confirm("¿Eliminar este gasto?")) return;
 
-        await fetch(API, {
-          method: "POST",
-          mode: "no-cors",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "delete_expense",
-            id: g.id
-          })
-        });
 
-        fetchExpenses();
-        fetchData();
-      });
+function editExpense(expense) {
+  const list = document.getElementById("expenseList");
+  const item = [...list.children].find(li => li.dataset.expenseId === String(expense.id));
+  if (!item) return;
 
-      li.appendChild(span);
-      li.appendChild(btn);
-      list.appendChild(li);
-    });
+  item.innerHTML = "";
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.value = expense.nombre;
+  nameInput.className = "expense-edit-input";
+  nameInput.setAttribute("aria-label", "Nombre del gasto");
 
+  const valueInput = document.createElement("input");
+  valueInput.type = "number";
+  valueInput.min = "0";
+  valueInput.step = "1";
+  valueInput.value = toStoreNumber(expense.valor);
+  valueInput.className = "expense-edit-input expense-edit-value";
+  valueInput.setAttribute("aria-label", "Valor del gasto");
+
+  const actions = document.createElement("span");
+  actions.className = "expense-actions";
+  actions.append(
+    createExpenseButton("Guardar", "expense-save", () => saveExpenseEdit(expense, nameInput, valueInput), "Guardar cambios"),
+    createExpenseButton("Cancelar", "expense-cancel", renderExpenses, "Cancelar edición")
+  );
+  item.append(nameInput, valueInput, actions);
+  nameInput.focus();
+}
+
+async function saveExpenseEdit(expense, nameInput, valueInput) {
+  const nombre = nameInput.value.trim();
+  const valor = Number(valueInput.value);
+  if (!nombre || !Number.isFinite(valor) || valor <= 0) {
+    alert("Ingrese nombre y un valor mayor a cero para el gasto");
+    return;
+  }
+
+  const previousExpense = { ...expense };
+  expenses = expenses.map(item => item.id === expense.id ? { ...item, nombre, valor } : item);
+  renderExpenses();
+
+  try {
+    // El servicio existente ya admite crear y eliminar gastos. Reemplazamos el
+    // registro para que la edición quede persistida sin cambiar ese servicio.
+    await sendExpenseChange("delete_expense", { id: expense.id });
+    await sendExpenseChange("add_expense", { nombre, valor });
+    scheduleExpensesSync();
+  } catch (err) {
+    expenses = expenses.map(item => item.id === expense.id ? previousExpense : item);
+    renderExpenses();
+    console.error("Error editando gasto:", err);
+    alert("No fue posible editar el gasto. Inténtelo de nuevo.");
+  }
+}
+
+async function deleteExpense(expense) {
+  if (!confirm("¿Eliminar este gasto?")) return;
+
+  const previousExpenses = expenses;
+  expenses = expenses.filter(item => item.id !== expense.id);
+  renderExpenses();
+
+  try {
+    await sendExpenseChange("delete_expense", { id: expense.id });
+    scheduleExpensesSync();
+  } catch (err) {
+    expenses = previousExpenses;
+    renderExpenses();
+    console.error("Error eliminando gasto:", err);
+    alert("No fue posible eliminar el gasto. Inténtelo de nuevo.");
+  }
+}
+
+document.getElementById("expenseForm").addEventListener("submit", addExpense);
+
+async function fetchExpenses() {
+  try {
+    const res = await fetch(`${API}?action=expenses&_=${Date.now()}`, { cache: "no-store" });
+    const data = await res.json();
+    if (!Array.isArray(data)) return;
+    expenses = data;
+    renderExpenses();
   } catch (err) {
     console.error("Error obteniendo gastos:", err);
   }

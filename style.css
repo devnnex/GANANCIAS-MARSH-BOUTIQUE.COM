@@ -1047,10 +1047,57 @@ th input[type="checkbox"] {
 .expense-list li {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  gap: 10px;
   padding: 8px 0;
   border-bottom: 1px dashed rgba(255,255,255,0.1);
   color: #fff;
   font-weight: 500;
+}
+
+.expense-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.expense-edit,
+.expense-delete,
+.expense-save,
+.expense-cancel {
+  border: 0;
+  border-radius: 7px;
+  padding: 6px 8px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.expense-edit,
+.expense-cancel {
+  background: rgba(255,255,255,0.14);
+}
+
+.expense-save {
+  background: #168a4a;
+}
+
+.expense-delete {
+  background: #b52a2a;
+}
+
+.expense-edit-input {
+  min-width: 0;
+  flex: 1;
+  padding: 7px 8px;
+  border: 1px solid rgba(255,255,255,0.22);
+  border-radius: 7px;
+  background: rgba(255,255,255,0.1);
+  color: #fff;
+}
+
+.expense-edit-value {
+  flex: 0 1 120px;
 }
 
 /* GANANCIA NETA */
