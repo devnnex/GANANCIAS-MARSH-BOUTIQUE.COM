@@ -22,6 +22,8 @@ const KPI_CACHE_TTL = 3000;
 const KPI_REFRESH_INTERVAL = 3000;
 const INVENTORY_CACHE_TTL = 3000;
 const STORE_SNAPSHOT_CACHE_KEY = "marsh-analysis-live-snapshot-v1";
+const EXPENSE_STATE_KEY = "marsh-expenses-v1";
+const EXPENSE_REMOVAL_MAX_AGE = 10 * 60 * 1000;
 const STORE_SNAPSHOT_MAX_AGE = 24 * 60 * 60 * 1000;
 const kpiCache = new Map();
 const kpiAnimations = new Map();
@@ -29,7 +31,39 @@ let activeKpiRequest = null;
 let kpiRequestSequence = 0;
 let latestStoreSnapshot = null;
 let lastKnownExpensesTotal = 0;
-let expenses = [];
+function restoreExpenseState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(EXPENSE_STATE_KEY) || "null");
+    if (!saved || !Array.isArray(saved.expenses)) throw new Error("No expense cache");
+    return {
+      expenses: saved.expenses.filter(item => item && item.id != null && item.nombre && toStoreNumber(item.valor) > 0),
+      deletedIds: Array.isArray(saved.deletedIds) ? saved.deletedIds : [],
+      pendingRemovals: Array.isArray(saved.pendingRemovals)
+        ? saved.pendingRemovals.filter(item => Date.now() - Number(item.createdAt) < EXPENSE_REMOVAL_MAX_AGE)
+        : []
+    };
+  } catch (_) {
+    return { expenses: [], deletedIds: [], pendingRemovals: [] };
+  }
+}
+
+const savedExpenseState = restoreExpenseState();
+let expenses = savedExpenseState.expenses;
+const deletedExpenseIds = new Set(savedExpenseState.deletedIds.map(String));
+let pendingExpenseRemovals = savedExpenseState.pendingRemovals;
+lastKnownExpensesTotal = expenses.reduce((sum, item) => sum + toStoreNumber(item.valor), 0);
+
+function persistExpenseState() {
+  try {
+    localStorage.setItem(EXPENSE_STATE_KEY, JSON.stringify({
+      expenses,
+      deletedIds: [...deletedExpenseIds],
+      pendingRemovals: pendingExpenseRemovals
+    }));
+  } catch (err) {
+    console.error("No fue posible guardar los gastos en este navegador:", err);
+  }
+}
 
 // MANEJAR CAMBIO DE MES Y POBLAR EL SELECTOR
 const monthSelect = document.getElementById("analysisMonth");
@@ -539,8 +573,7 @@ function animateNumber(id, target) {
 }
 
 
-// 🔹 Agregar gasto
-// 🔹 Agregar gasto
+// Los gastos guardados por el usuario no se descartan por una lectura vacía o atrasada.
 function updateExpenseKpis() {
   lastKnownExpensesTotal = expenses.reduce(
     (sum, expense) => sum + toStoreNumber(expense.valor),
@@ -573,6 +606,24 @@ function sendExpenseChange(action, payload) {
 function scheduleExpensesSync() {
   // Apps Script puede tardar unos instantes en reflejar el cambio guardado.
   window.setTimeout(fetchExpenses, 750);
+  window.setTimeout(fetchExpenses, 3000);
+}
+
+function expenseMatches(left, right) {
+  return String(left.nombre).trim() === String(right.nombre).trim() &&
+    toStoreNumber(left.valor) === toStoreNumber(right.valor);
+}
+
+function rememberExpenseRemoval(expense) {
+  pendingExpenseRemovals.push({
+    nombre: expense.syncNombre ?? expense.nombre,
+    valor: expense.syncValor ?? expense.valor,
+    createdAt: Date.now()
+  });
+}
+
+function newExpenseId() {
+  return `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function createExpenseButton(label, className, onClick, title) {
@@ -586,7 +637,7 @@ function createExpenseButton(label, className, onClick, title) {
   return button;
 }
 
-function renderExpenses() {
+function renderExpenses({ refreshKpis = true } = {}) {
   const list = document.getElementById("expenseList");
   if (!list) return;
   list.innerHTML = "";
@@ -615,7 +666,8 @@ function renderExpenses() {
     list.appendChild(li);
   });
 
-  updateExpenseKpis();
+  persistExpenseState();
+  if (refreshKpis) updateExpenseKpis();
 }
 
 async function addExpense(event) {
@@ -629,8 +681,7 @@ async function addExpense(event) {
     return;
   }
 
-  const temporaryExpense = { id: `pending-${Date.now()}`, nombre, valor };
-  expenses.push(temporaryExpense);
+  expenses.push({ id: newExpenseId(), nombre, valor, syncNombre: nombre, syncValor: valor });
   nameInput.value = "";
   valueInput.value = "";
   renderExpenses();
@@ -639,10 +690,8 @@ async function addExpense(event) {
     await sendExpenseChange("add_expense", { nombre, valor });
     scheduleExpensesSync();
   } catch (err) {
-    expenses = expenses.filter(expense => expense.id !== temporaryExpense.id);
-    renderExpenses();
     console.error("Error agregando gasto:", err);
-    alert("No fue posible guardar el gasto. Inténtelo de nuevo.");
+    alert("El gasto quedó guardado en este navegador, pero no se pudo sincronizar con el servidor.");
   }
 }
 
@@ -686,39 +735,53 @@ async function saveExpenseEdit(expense, nameInput, valueInput) {
     return;
   }
 
-  const previousExpense = { ...expense };
-  expenses = expenses.map(item => item.id === expense.id ? { ...item, nombre, valor } : item);
+  if (nombre === expense.nombre && valor === toStoreNumber(expense.valor)) {
+    renderExpenses();
+    return;
+  }
+
+  if (expense.remoteId != null) {
+    deletedExpenseIds.add(String(expense.remoteId));
+  } else {
+    rememberExpenseRemoval(expense);
+  }
+  expenses = expenses.map(item => item.id === expense.id ? {
+    ...item, nombre, valor, remoteId: null, syncNombre: nombre, syncValor: valor
+  } : item);
   renderExpenses();
 
   try {
-    // El servicio existente ya admite crear y eliminar gastos. Reemplazamos el
-    // registro para que la edición quede persistida sin cambiar ese servicio.
-    await sendExpenseChange("delete_expense", { id: expense.id });
+    // El servicio actual edita mediante eliminación y nueva creación.
+    if (expense.remoteId != null) {
+      await sendExpenseChange("delete_expense", { id: expense.remoteId });
+    }
     await sendExpenseChange("add_expense", { nombre, valor });
     scheduleExpensesSync();
   } catch (err) {
-    expenses = expenses.map(item => item.id === expense.id ? previousExpense : item);
-    renderExpenses();
     console.error("Error editando gasto:", err);
-    alert("No fue posible editar el gasto. Inténtelo de nuevo.");
+    alert("El cambio quedó guardado en este navegador, pero no se pudo sincronizar con el servidor.");
   }
 }
 
 async function deleteExpense(expense) {
   if (!confirm("¿Eliminar este gasto?")) return;
 
-  const previousExpenses = expenses;
+  if (expense.remoteId != null) {
+    deletedExpenseIds.add(String(expense.remoteId));
+  } else {
+    rememberExpenseRemoval(expense);
+  }
   expenses = expenses.filter(item => item.id !== expense.id);
   renderExpenses();
 
   try {
-    await sendExpenseChange("delete_expense", { id: expense.id });
+    if (expense.remoteId != null) {
+      await sendExpenseChange("delete_expense", { id: expense.remoteId });
+    }
     scheduleExpensesSync();
   } catch (err) {
-    expenses = previousExpenses;
-    renderExpenses();
     console.error("Error eliminando gasto:", err);
-    alert("No fue posible eliminar el gasto. Inténtelo de nuevo.");
+    alert("El gasto se quitó de este navegador, pero no se pudo sincronizar con el servidor.");
   }
 }
 
@@ -729,7 +792,37 @@ async function fetchExpenses() {
     const res = await fetch(`${API}?action=expenses&_=${Date.now()}`, { cache: "no-store" });
     const data = await res.json();
     if (!Array.isArray(data)) return;
-    expenses = data;
+    pendingExpenseRemovals = pendingExpenseRemovals.filter(item =>
+      Date.now() - Number(item.createdAt) < EXPENSE_REMOVAL_MAX_AGE
+    );
+    for (const remote of data) {
+      if (!remote || remote.id == null || !remote.nombre || !(toStoreNumber(remote.valor) > 0)) continue;
+      const remoteId = String(remote.id);
+      if (deletedExpenseIds.has(remoteId)) continue;
+      if (expenses.some(item => String(item.remoteId ?? item.id) === remoteId)) continue;
+
+      const pending = expenses.find(item => item.remoteId == null && expenseMatches(
+        { nombre: item.syncNombre ?? item.nombre, valor: item.syncValor ?? item.valor }, remote
+      ));
+      if (pending) {
+        pending.remoteId = remote.id;
+        delete pending.syncNombre;
+        delete pending.syncValor;
+        continue;
+      }
+
+      const removalIndex = pendingExpenseRemovals.findIndex(item => expenseMatches(item, remote));
+      if (removalIndex !== -1) {
+        pendingExpenseRemovals.splice(removalIndex, 1);
+        deletedExpenseIds.add(remoteId);
+        sendExpenseChange("delete_expense", { id: remote.id }).catch(err =>
+          console.error("Error sincronizando eliminación de gasto:", err)
+        );
+        continue;
+      }
+
+      expenses.push({ id: newExpenseId(), remoteId: remote.id, nombre: remote.nombre, valor: remote.valor });
+    }
     renderExpenses();
   } catch (err) {
     console.error("Error obteniendo gastos:", err);
@@ -1023,6 +1116,7 @@ setInterval(() => {
 
 // Primera carga: pinta la última sincronización al instante y valida el dato en vivo.
 latestStoreSnapshot = restoreStoreSnapshot();
+renderExpenses({ refreshKpis: false });
 fetchData({ force: true, background: Boolean(latestStoreSnapshot) }).finally(() => {
   fetchExpenses();
   renderBrandAnalysis();
