@@ -1,5 +1,5 @@
  
-const API = "https://script.google.com/macros/s/AKfycbzDFG8R-elR_nc1E3lSW6xd6hIpMHE2RKaC9bRiiR5i-ROJgyMiPdFfeM5pAmsBYhct/exec";
+const API = "https://script.google.com/macros/s/AKfycbw5S5WlEPIlmL16dPFyOlio51QvJGQOtP4jn5i2mFTPwkyNDRvHKeo5xHOFHk45QuYxlQ/exec";
 const STORE_API = "https://script.google.com/macros/s/AKfycbzi8L_mvDiOIQmicjbzPGWLFoKVL54snEi0T7Ng6bq_yPI_S85JvckhLde6SZEk12NLZw/exec";
 
 
@@ -15,15 +15,15 @@ const STORE_API = "https://script.google.com/macros/s/AKfycbzi8L_mvDiOIQmicjbzPG
 // aqui empieza el desarrollo de la seccion de Analisis 🔹
 const ANALYSIS_STATE = {
   month: new Date().getMonth(),
-  year: new Date().getFullYear()
+  year: new Date().getFullYear(),
+  range: "month"
 };
 
 const KPI_CACHE_TTL = 3000;
 const KPI_REFRESH_INTERVAL = 3000;
 const INVENTORY_CACHE_TTL = 3000;
 const STORE_SNAPSHOT_CACHE_KEY = "marsh-analysis-live-snapshot-v1";
-const EXPENSE_STATE_KEY = "marsh-expenses-v1";
-const EXPENSE_REMOVAL_MAX_AGE = 10 * 60 * 1000;
+const EXPENSE_SYNC_INTERVAL = 2000;
 const STORE_SNAPSHOT_MAX_AGE = 24 * 60 * 60 * 1000;
 const kpiCache = new Map();
 const kpiAnimations = new Map();
@@ -31,42 +31,15 @@ let activeKpiRequest = null;
 let kpiRequestSequence = 0;
 let latestStoreSnapshot = null;
 let lastKnownExpensesTotal = 0;
-function restoreExpenseState() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(EXPENSE_STATE_KEY) || "null");
-    if (!saved || !Array.isArray(saved.expenses)) throw new Error("No expense cache");
-    return {
-      expenses: saved.expenses.filter(item => item && item.id != null && item.nombre && toStoreNumber(item.valor) > 0),
-      deletedIds: Array.isArray(saved.deletedIds) ? saved.deletedIds : [],
-      pendingRemovals: Array.isArray(saved.pendingRemovals)
-        ? saved.pendingRemovals.filter(item => Date.now() - Number(item.createdAt) < EXPENSE_REMOVAL_MAX_AGE)
-        : []
-    };
-  } catch (_) {
-    return { expenses: [], deletedIds: [], pendingRemovals: [] };
-  }
-}
-
-const savedExpenseState = restoreExpenseState();
-let expenses = savedExpenseState.expenses;
-const deletedExpenseIds = new Set(savedExpenseState.deletedIds.map(String));
-let pendingExpenseRemovals = savedExpenseState.pendingRemovals;
-lastKnownExpensesTotal = expenses.reduce((sum, item) => sum + toStoreNumber(item.valor), 0);
-
-function persistExpenseState() {
-  try {
-    localStorage.setItem(EXPENSE_STATE_KEY, JSON.stringify({
-      expenses,
-      deletedIds: [...deletedExpenseIds],
-      pendingRemovals: pendingExpenseRemovals
-    }));
-  } catch (err) {
-    console.error("No fue posible guardar los gastos en este navegador:", err);
-  }
-}
+let expenses = [];
+let expenseRequestInFlight = false;
+let expenseMutationCount = 0;
+let lastExpenseFingerprint = "";
+let lastExpensePeriodKey = "";
 
 // MANEJAR CAMBIO DE MES Y POBLAR EL SELECTOR
 const monthSelect = document.getElementById("analysisMonth");
+const rangeSelect = document.getElementById("analysisRange");
 
 const monthNames = [
   "Enero","Febrero","Marzo","Abril","Mayo","Junio",
@@ -103,11 +76,79 @@ function populateYearSelect() {
 // Llenado inicial
 populateYearSelect();
 
+function getAnalysisDateRange(
+  range = ANALYSIS_STATE.range,
+  month = ANALYSIS_STATE.month,
+  year = ANALYSIS_STATE.year
+) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  let start;
+  let end;
+
+  if (range === "today") {
+    start = new Date(today);
+    end = new Date(today);
+    end.setDate(end.getDate() + 1);
+  } else if (range === "yesterday") {
+    end = new Date(today);
+    start = new Date(today);
+    start.setDate(start.getDate() - 1);
+  } else if (range === "last7" || range === "last15") {
+    const days = range === "last7" ? 7 : 15;
+    start = new Date(today);
+    start.setDate(start.getDate() - (days - 1));
+    end = new Date(today);
+    end.setDate(end.getDate() + 1);
+  } else {
+    start = new Date(year, month, 1);
+    end = new Date(year, month + 1, 1);
+  }
+
+  return { start, end };
+}
+
+function getAnalysisPeriodLabel() {
+  if (ANALYSIS_STATE.range === "today") return "Hoy";
+  if (ANALYSIS_STATE.range === "yesterday") return "Ayer";
+  if (ANALYSIS_STATE.range === "last7") return "Últimos 7 días";
+  if (ANALYSIS_STATE.range === "last15") return "Últimos 15 días";
+  return `${monthNames[ANALYSIS_STATE.month]} ${ANALYSIS_STATE.year}`;
+}
+
+function updateAnalysisFilterUi() {
+  const isMonth = ANALYSIS_STATE.range === "month";
+  monthSelect.disabled = !isMonth;
+  yearSelect.disabled = !isMonth;
+
+  const label = getAnalysisPeriodLabel();
+  const salesTitle = document.getElementById("kpiVentasTitle");
+  const profitTitle = document.getElementById("kpiGananciaTitle");
+  const discountsTitle = document.getElementById("kpiDescuentosTitle");
+  const investmentTitle = document.getElementById("kpiInversionTitle");
+  const expenseTitle = document.getElementById("expensePeriodTitle");
+  if (salesTitle) salesTitle.textContent = `Ventas: ${label}`;
+  if (profitTitle) profitTitle.textContent = `Ganancia con Descuentos: ${label}`;
+  if (discountsTitle) discountsTitle.textContent = `Descuentos: ${label}`;
+  if (investmentTitle) investmentTitle.textContent = `Sugerido a Invertir: ${label}`;
+  if (expenseTitle) expenseTitle.textContent = `Gastos: ${label}`;
+}
+
+function refreshAnalysisPeriod({ refreshYearChart = false } = {}) {
+  updateAnalysisFilterUi();
+  fetchExpenses({ force: true });
+  fetchData().finally(() => {
+    if (refreshYearChart) loadSalesByMonthChart();
+    loadTopProductsChart();
+  });
+}
+
 // ESCUCHAR CAMBIOS EN SELECTORES
 monthSelect.addEventListener("change", e => {
   ANALYSIS_STATE.month = Number(e.target.value);
-  fetchData();
-  if (topProductsChart) loadTopProductsChart();
+  ANALYSIS_STATE.range = "month";
+  rangeSelect.value = "month";
+  refreshAnalysisPeriod();
 });
 
 yearSelect.addEventListener("change", e => {
@@ -120,11 +161,24 @@ yearSelect.addEventListener("change", e => {
     yearSelect.value = String(selectedYear);
   }
 
-  fetchData().finally(() => {
-    loadSalesByMonthChart();
-    loadTopProductsChart();
-  });
+  ANALYSIS_STATE.range = "month";
+  rangeSelect.value = "month";
+  refreshAnalysisPeriod({ refreshYearChart: true });
 });
+
+rangeSelect.addEventListener("change", e => {
+  ANALYSIS_STATE.range = e.target.value;
+  if (ANALYSIS_STATE.range !== "month") {
+    const now = new Date();
+    ANALYSIS_STATE.month = now.getMonth();
+    ANALYSIS_STATE.year = now.getFullYear();
+    monthSelect.value = String(ANALYSIS_STATE.month);
+    yearSelect.value = String(ANALYSIS_STATE.year);
+  }
+  refreshAnalysisPeriod();
+});
+
+updateAnalysisFilterUi();
 
 
 
@@ -135,8 +189,9 @@ let topProductsChart = null;
 
 
 // 🔹 Función para obtener los KPIs y top productos
-function getPeriodKey(month, year) {
-  return `${year}-${month}`;
+function getPeriodKey(month, year, range = ANALYSIS_STATE.range) {
+  const dates = getAnalysisDateRange(range, month, year);
+  return `${range}-${dates.start.getTime()}-${dates.end.getTime()}`;
 }
 
 function isFuturePeriod(month, year) {
@@ -217,11 +272,12 @@ function getSaleCost(sale, inventoryIndex) {
   return toStoreNumber(sale.subtotal || sale.total) / 2;
 }
 
-function buildLiveKpiData(sales, inventory, month, year) {
+function buildLiveKpiData(sales, inventory, month, year, range = ANALYSIS_STATE.range) {
   const inventoryIndex = buildInventoryIndex(inventory);
+  const dates = getAnalysisDateRange(range, month, year);
   const periodSales = (Array.isArray(sales) ? sales : []).filter(sale => {
-    const date = parseStoreSaleDate(sale.fecha);
-    return date && date.getMonth() === month && date.getFullYear() === year;
+    const date = parseStoreSaleDate(sale.fechaISO || sale.fecha);
+    return date && date >= dates.start && date < dates.end;
   });
 
   let totalVentas = 0;
@@ -573,7 +629,7 @@ function animateNumber(id, target) {
 }
 
 
-// Los gastos guardados por el usuario no se descartan por una lectura vacía o atrasada.
+// Apps Script es la fuente de verdad de los gastos en todos los dispositivos.
 function updateExpenseKpis() {
   lastKnownExpensesTotal = expenses.reduce(
     (sum, expense) => sum + toStoreNumber(expense.valor),
@@ -590,83 +646,156 @@ function updateExpenseKpis() {
     return;
   }
 
-  // En la primera carga, fetchData usará el total local al terminar de cargar ventas.
+  // En la primera carga, fetchData usará el total recibido desde Apps Script.
   fetchData({ background: true });
 }
 
-function sendExpenseChange(action, payload) {
-  return fetch(API, {
-    method: "POST",
-    mode: "no-cors",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, ...payload })
+async function sendExpenseChange(action, payload) {
+  const params = new URLSearchParams({
+    action,
+    ...payload,
+    _: Date.now().toString()
   });
-}
+  const response = await fetch(`${API}?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`Gastos HTTP ${response.status}`);
 
-function scheduleExpensesSync() {
-  // Apps Script puede tardar unos instantes en reflejar el cambio guardado.
-  window.setTimeout(fetchExpenses, 750);
-  window.setTimeout(fetchExpenses, 3000);
-}
-
-function expenseMatches(left, right) {
-  return String(left.nombre).trim() === String(right.nombre).trim() &&
-    toStoreNumber(left.valor) === toStoreNumber(right.valor);
-}
-
-function rememberExpenseRemoval(expense) {
-  pendingExpenseRemovals.push({
-    nombre: expense.syncNombre ?? expense.nombre,
-    valor: expense.syncValor ?? expense.valor,
-    createdAt: Date.now()
-  });
+  const result = await response.json();
+  if (!result || result.success !== true) {
+    throw new Error(result?.message || "Apps Script no pudo guardar el gasto");
+  }
+  return result;
 }
 
 function newExpenseId() {
   return `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function createExpenseButton(label, className, onClick, title) {
+function createExpenseButton(label, className, onClick, title, disabled = false) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = className;
   button.textContent = label;
   button.title = title;
   button.setAttribute("aria-label", title);
+  button.disabled = disabled;
   button.addEventListener("click", onClick);
   return button;
 }
 
-function renderExpenses({ refreshKpis = true } = {}) {
+function normalizeExpense(expense) {
+  return {
+    id: String(expense.id),
+    nombre: String(expense.nombre || "").trim(),
+    valor: toStoreNumber(expense.valor),
+    fecha: expense.fecha || null,
+    actualizado: expense.actualizado || null
+  };
+}
+
+function getExpenseFingerprint(items) {
+  return items
+    .map(item => [item.id, item.nombre, toStoreNumber(item.valor), item.actualizado || item.fecha || ""].join("|"))
+    .sort()
+    .join(";");
+}
+
+function setExpenseFormBusy(isBusy) {
+  const form = document.getElementById("expenseForm");
+  if (!form) return;
+  [...form.elements].forEach(element => {
+    element.disabled = isBusy;
+  });
+  form.setAttribute("aria-busy", String(isBusy));
+}
+
+async function confirmExpenseAction(action, expense) {
+  const isDelete = action === "delete";
+  const title = isDelete ? "Eliminar gasto" : "Editar gasto";
+  const text = isDelete
+    ? `¿Confirma que desea eliminar "${expense.nombre}"?`
+    : `¿Desea editar "${expense.nombre}"?`;
+
+  if (typeof Swal !== "undefined") {
+    const result = await Swal.fire({
+      title,
+      text,
+      icon: isDelete ? "warning" : "question",
+      showCancelButton: true,
+      confirmButtonText: isDelete ? "Sí, eliminar" : "Sí, editar",
+      cancelButtonText: "Cancelar",
+      background: "#0b0b0b",
+      color: "#ffffff",
+      customClass: {
+        popup: "neo-glass",
+        title: "neo-title",
+        confirmButton: isDelete ? "neo-confirm danger" : "neo-confirm",
+        cancelButton: "neo-cancel"
+      },
+      buttonsStyling: false
+    });
+    return result.isConfirmed;
+  }
+
+  return confirm(text);
+}
+
+function getExpenseRenderSignature(expense) {
+  return [expense.nombre, toStoreNumber(expense.valor), expense.pending ? "pending" : "saved"].join("|");
+}
+
+function createExpenseListItem(expense) {
+  const li = document.createElement("li");
+  li.className = "expense-item";
+  li.dataset.expenseId = String(expense.id);
+  li.dataset.expenseSignature = getExpenseRenderSignature(expense);
+
+  const text = document.createElement("span");
+  text.className = "expense-text";
+  text.append(`${expense.nombre}: `);
+  const value = document.createElement("span");
+  value.className = "expense-value";
+  value.textContent = `$${toStoreNumber(expense.valor).toLocaleString("es-CO")}`;
+  text.appendChild(value);
+
+  const actions = document.createElement("span");
+  actions.className = "expense-actions";
+  actions.append(
+    createExpenseButton("Editar", "expense-edit", () => editExpense(expense), "Editar gasto", expense.pending),
+    createExpenseButton("Eliminar", "expense-delete", () => deleteExpense(expense), "Eliminar gasto", expense.pending)
+  );
+
+  li.append(text, actions);
+  return li;
+}
+
+function renderExpenses({ refreshKpis = true, forceIds = [] } = {}) {
   const list = document.getElementById("expenseList");
   if (!list) return;
-  list.innerHTML = "";
+  const forced = new Set(forceIds.map(String));
+  const existing = new Map(
+    [...list.children].map(item => [item.dataset.expenseId, item])
+  );
 
-  expenses.forEach(expense => {
-    const li = document.createElement("li");
-    li.className = "expense-item";
-    li.dataset.expenseId = String(expense.id);
+  expenses.forEach((expense, index) => {
+    const id = String(expense.id);
+    const signature = getExpenseRenderSignature(expense);
+    let item = existing.get(id);
 
-    const text = document.createElement("span");
-    text.className = "expense-text";
-    text.append(`${expense.nombre}: `);
-    const value = document.createElement("span");
-    value.className = "expense-value";
-    value.textContent = `$${toStoreNumber(expense.valor).toLocaleString("es-CO")}`;
-    text.appendChild(value);
+    if (!item || item.dataset.expenseSignature !== signature || forced.has(id)) {
+      const replacement = createExpenseListItem(expense);
+      if (item) item.replaceWith(replacement);
+      item = replacement;
+    }
 
-    const actions = document.createElement("span");
-    actions.className = "expense-actions";
-    actions.append(
-      createExpenseButton("Editar", "expense-edit", () => editExpense(expense), "Editar gasto"),
-      createExpenseButton("Eliminar", "expense-delete", () => deleteExpense(expense), "Eliminar gasto")
-    );
-
-    li.append(text, actions);
-    list.appendChild(li);
+    const itemAtPosition = list.children[index];
+    if (itemAtPosition !== item) {
+      list.insertBefore(item, itemAtPosition || null);
+    }
+    existing.delete(id);
   });
 
-  persistExpenseState();
+  existing.forEach(item => item.remove());
+
   if (refreshKpis) updateExpenseKpis();
 }
 
@@ -681,23 +810,51 @@ async function addExpense(event) {
     return;
   }
 
-  expenses.push({ id: newExpenseId(), nombre, valor, syncNombre: nombre, syncValor: valor });
+  const temporaryId = newExpenseId();
+  const currentDates = getAnalysisDateRange();
+  const now = new Date();
+  const belongsToCurrentFilter = now >= currentDates.start && now < currentDates.end;
+  if (belongsToCurrentFilter) {
+    expenses.push({ id: temporaryId, nombre, valor, pending: true });
+  }
   nameInput.value = "";
   valueInput.value = "";
-  renderExpenses();
+  setExpenseFormBusy(true);
+  if (belongsToCurrentFilter) renderExpenses();
 
+  expenseMutationCount++;
   try {
-    await sendExpenseChange("add_expense", { nombre, valor });
-    scheduleExpensesSync();
+    const result = await sendExpenseChange("add_expense", {
+      nombre,
+      valor,
+      mutationId: temporaryId
+    });
+    const savedExpense = normalizeExpense(result.expense);
+    if (belongsToCurrentFilter) {
+      expenses = expenses.map(item => item.id === temporaryId ? savedExpense : item);
+      renderExpenses();
+    }
   } catch (err) {
     console.error("Error agregando gasto:", err);
-    alert("El gasto quedó guardado en este navegador, pero no se pudo sincronizar con el servidor.");
+    if (belongsToCurrentFilter) {
+      expenses = expenses.filter(item => item.id !== temporaryId);
+      renderExpenses();
+    }
+    nameInput.value = nombre;
+    valueInput.value = valor;
+    alert(err.message || "No fue posible registrar el gasto. Intente nuevamente.");
+  } finally {
+    expenseMutationCount--;
+    setExpenseFormBusy(false);
+    fetchExpenses({ force: true });
   }
 }
 
 
 
-function editExpense(expense) {
+async function editExpense(expense) {
+  if (!await confirmExpenseAction("edit", expense)) return;
+
   const list = document.getElementById("expenseList");
   const item = [...list.children].find(li => li.dataset.expenseId === String(expense.id));
   if (!item) return;
@@ -721,7 +878,7 @@ function editExpense(expense) {
   actions.className = "expense-actions";
   actions.append(
     createExpenseButton("Guardar", "expense-save", () => saveExpenseEdit(expense, nameInput, valueInput), "Guardar cambios"),
-    createExpenseButton("Cancelar", "expense-cancel", renderExpenses, "Cancelar edición")
+    createExpenseButton("Cancelar", "expense-cancel", () => renderExpenses({ forceIds: [expense.id] }), "Cancelar edición")
   );
   item.append(nameInput, valueInput, actions);
   nameInput.focus();
@@ -736,96 +893,112 @@ async function saveExpenseEdit(expense, nameInput, valueInput) {
   }
 
   if (nombre === expense.nombre && valor === toStoreNumber(expense.valor)) {
-    renderExpenses();
+    renderExpenses({ forceIds: [expense.id] });
     return;
   }
 
-  if (expense.remoteId != null) {
-    deletedExpenseIds.add(String(expense.remoteId));
-  } else {
-    rememberExpenseRemoval(expense);
-  }
+  const previousExpense = { ...expense };
   expenses = expenses.map(item => item.id === expense.id ? {
-    ...item, nombre, valor, remoteId: null, syncNombre: nombre, syncValor: valor
+    ...item, nombre, valor, pending: true
   } : item);
   renderExpenses();
 
+  expenseMutationCount++;
   try {
-    // El servicio actual edita mediante eliminación y nueva creación.
-    if (expense.remoteId != null) {
-      await sendExpenseChange("delete_expense", { id: expense.remoteId });
-    }
-    await sendExpenseChange("add_expense", { nombre, valor });
-    scheduleExpensesSync();
+    const result = await sendExpenseChange("update_expense", {
+      id: expense.id,
+      nombre,
+      valor
+    });
+    const savedExpense = normalizeExpense(result.expense);
+    expenses = expenses.map(item => item.id === expense.id ? savedExpense : item);
+    renderExpenses();
   } catch (err) {
     console.error("Error editando gasto:", err);
-    alert("El cambio quedó guardado en este navegador, pero no se pudo sincronizar con el servidor.");
+    expenses = expenses.map(item => item.id === expense.id ? previousExpense : item);
+    renderExpenses();
+    alert(err.message || "No fue posible editar el gasto. Intente nuevamente.");
+  } finally {
+    expenseMutationCount--;
+    fetchExpenses({ force: true });
   }
 }
 
 async function deleteExpense(expense) {
-  if (!confirm("¿Eliminar este gasto?")) return;
+  if (!await confirmExpenseAction("delete", expense)) return;
 
-  if (expense.remoteId != null) {
-    deletedExpenseIds.add(String(expense.remoteId));
-  } else {
-    rememberExpenseRemoval(expense);
-  }
+  const previousIndex = expenses.findIndex(item => item.id === expense.id);
   expenses = expenses.filter(item => item.id !== expense.id);
   renderExpenses();
 
+  expenseMutationCount++;
   try {
-    if (expense.remoteId != null) {
-      await sendExpenseChange("delete_expense", { id: expense.remoteId });
-    }
-    scheduleExpensesSync();
+    await sendExpenseChange("delete_expense", { id: expense.id });
   } catch (err) {
     console.error("Error eliminando gasto:", err);
-    alert("El gasto se quitó de este navegador, pero no se pudo sincronizar con el servidor.");
+    expenses.splice(Math.max(0, previousIndex), 0, expense);
+    renderExpenses();
+    alert(err.message || "No fue posible eliminar el gasto. Intente nuevamente.");
+  } finally {
+    expenseMutationCount--;
+    fetchExpenses({ force: true });
   }
 }
 
 document.getElementById("expenseForm").addEventListener("submit", addExpense);
 
-async function fetchExpenses() {
+async function fetchExpenses({ force = false } = {}) {
+  if (expenseRequestInFlight || expenseMutationCount > 0) return;
+
+  const requestedMonth = ANALYSIS_STATE.month;
+  const requestedYear = ANALYSIS_STATE.year;
+  const requestedRange = ANALYSIS_STATE.range;
+  const requestedDates = getAnalysisDateRange(requestedRange, requestedMonth, requestedYear);
+  const requestedPeriodKey = getPeriodKey(requestedMonth, requestedYear, requestedRange);
+  expenseRequestInFlight = true;
+
   try {
-    const res = await fetch(`${API}?action=expenses&_=${Date.now()}`, { cache: "no-store" });
+    const params = new URLSearchParams({
+      action: "expenses",
+      month: String(requestedMonth),
+      year: String(requestedYear),
+      from: String(requestedDates.start.getTime()),
+      to: String(requestedDates.end.getTime()),
+      _: Date.now().toString()
+    });
+    const res = await fetch(`${API}?${params.toString()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`Gastos HTTP ${res.status}`);
+
     const data = await res.json();
     if (!Array.isArray(data)) return;
-    pendingExpenseRemovals = pendingExpenseRemovals.filter(item =>
-      Date.now() - Number(item.createdAt) < EXPENSE_REMOVAL_MAX_AGE
-    );
-    for (const remote of data) {
-      if (!remote || remote.id == null || !remote.nombre || !(toStoreNumber(remote.valor) > 0)) continue;
-      const remoteId = String(remote.id);
-      if (deletedExpenseIds.has(remoteId)) continue;
-      if (expenses.some(item => String(item.remoteId ?? item.id) === remoteId)) continue;
+    if (
+      requestedMonth !== ANALYSIS_STATE.month ||
+      requestedYear !== ANALYSIS_STATE.year ||
+      requestedRange !== ANALYSIS_STATE.range
+    ) return;
+    if (expenseMutationCount > 0) return;
 
-      const pending = expenses.find(item => item.remoteId == null && expenseMatches(
-        { nombre: item.syncNombre ?? item.nombre, valor: item.syncValor ?? item.valor }, remote
-      ));
-      if (pending) {
-        pending.remoteId = remote.id;
-        delete pending.syncNombre;
-        delete pending.syncValor;
-        continue;
-      }
+    const serverExpenses = data
+      .filter(item => item && item.id != null && item.nombre && toStoreNumber(item.valor) > 0)
+      .map(normalizeExpense);
+    const fingerprint = getExpenseFingerprint(serverExpenses);
+    const visibleFingerprint = getExpenseFingerprint(expenses.filter(item => !item.pending));
+    const periodChanged = requestedPeriodKey !== lastExpensePeriodKey;
 
-      const removalIndex = pendingExpenseRemovals.findIndex(item => expenseMatches(item, remote));
-      if (removalIndex !== -1) {
-        pendingExpenseRemovals.splice(removalIndex, 1);
-        deletedExpenseIds.add(remoteId);
-        sendExpenseChange("delete_expense", { id: remote.id }).catch(err =>
-          console.error("Error sincronizando eliminación de gasto:", err)
-        );
-        continue;
-      }
-
-      expenses.push({ id: newExpenseId(), remoteId: remote.id, nombre: remote.nombre, valor: remote.valor });
+    if (
+      periodChanged ||
+      fingerprint !== lastExpenseFingerprint ||
+      (force && visibleFingerprint !== fingerprint)
+    ) {
+      expenses = serverExpenses;
+      lastExpenseFingerprint = fingerprint;
+      lastExpensePeriodKey = requestedPeriodKey;
+      renderExpenses();
     }
-    renderExpenses();
   } catch (err) {
     console.error("Error obteniendo gastos:", err);
+  } finally {
+    expenseRequestInFlight = false;
   }
 }
 
@@ -1084,11 +1257,10 @@ async function renderBrandAnalysis() {
 }
 
 
-// Gastos usan su backend administrativo; ventas y marcas se actualizan aparte en vivo.
+// Gastos se consultan directamente en Apps Script para reflejar otros dispositivos.
 setInterval(() => {
-  if (activeKpiRequest) return;
-  fetchExpenses();
-}, 30000);
+  if (document.visibilityState === "visible") fetchExpenses();
+}, EXPENSE_SYNC_INTERVAL);
 
 // Los KPIs se sincronizan sin competir con los cambios manuales de filtro.
 setInterval(() => {
@@ -1099,6 +1271,7 @@ setInterval(() => {
 
 function syncNowWhenReturning() {
   if (document.visibilityState === "visible") {
+    fetchExpenses({ force: true });
     fetchData({ force: true, background: true });
   }
 }
@@ -1114,11 +1287,11 @@ setInterval(() => {
   loadTopProductsChart();
 }, 120000);
 
-// Primera carga: pinta la última sincronización al instante y valida el dato en vivo.
+// Primera carga: los gastos siempre llegan desde Apps Script.
 latestStoreSnapshot = restoreStoreSnapshot();
 renderExpenses({ refreshKpis: false });
 fetchData({ force: true, background: Boolean(latestStoreSnapshot) }).finally(() => {
-  fetchExpenses();
+  fetchExpenses({ force: true });
   renderBrandAnalysis();
   loadSalesByMonthChart();
   loadTopProductsChart();

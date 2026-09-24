@@ -71,6 +71,13 @@
 
     <!-- Selector Mes / Año -->
     <div class="analysis-filters sales-filters">
+  <select id="analysisRange" aria-label="Rango de análisis">
+    <option value="month">Mes seleccionado</option>
+    <option value="today">Hoy</option>
+    <option value="yesterday">Ayer</option>
+    <option value="last7">Últimos 7 días</option>
+    <option value="last15">Últimos 15 días</option>
+  </select>
   <select id="analysisMonth"></select>
   <select id="analysisYear"></select>
 </div>
@@ -82,25 +89,25 @@
   <div class="analysis-grid">
 
     <div class="analysis-card primary">
-      <h4>Ventas del Mes</h4>
+      <h4 id="kpiVentasTitle">Ventas del Mes</h4>
       <span id="kpiVentas">Cargando...</span>
       <small class="kpi-period-status" hidden></small>
     </div>
 
     <div class="analysis-card success">
-      <h4>Ganancia/Mes con Descuentos</h4>
+      <h4 id="kpiGananciaTitle">Ganancia/Mes con Descuentos</h4>
       <span id="kpiGanancia">Cargando...</span>
       <small class="kpi-period-status" hidden></small>
     </div>
 
     <div class="analysis-card warning">
-      <h4>Total Descuentos</h4>
+      <h4 id="kpiDescuentosTitle">Total Descuentos</h4>
       <span id="kpiDescuentos">Cargando...</span>
       <small class="kpi-period-status" hidden></small>
     </div>
 
     <div class="analysis-card info">
-      <h4>Sugerido a Invertir</h4>
+      <h4 id="kpiInversionTitle">Sugerido a Invertir</h4>
       <span id="kpiSinDescuento">Cargando...</span>
       <small class="kpi-period-status" hidden></small>
     </div>
@@ -114,7 +121,7 @@
       GASTOS 
      ========================= -->
     <div class="analysis-card gastos-card">
-      <h3>Gastos del Mes</h3>
+      <h3 id="expensePeriodTitle">Gastos del Mes</h3>
 
       <form id="expenseForm" class="expense-form">
         <input type="text" id="gastoNombre" placeholder="Nombre del gasto" required>

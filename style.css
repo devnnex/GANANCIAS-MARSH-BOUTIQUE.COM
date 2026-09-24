@@ -1167,6 +1167,11 @@ th input[type="checkbox"] {
 }
 
 /* Opciones dentro del select */
+.analysis-filters select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .analysis-filters select option,
 .sales-filters select option {
   background: rgba(10,36,75,0.9); /* azul oscuro sólido dentro */
