@@ -1259,7 +1259,7 @@ async function renderBrandAnalysis() {
 
 // Gastos se consultan directamente en Apps Script para reflejar otros dispositivos.
 setInterval(() => {
-  if (document.visibilityState === "visible") fetchExpenses();
+  fetchExpenses();
 }, EXPENSE_SYNC_INTERVAL);
 
 // Los KPIs se sincronizan sin competir con los cambios manuales de filtro.
